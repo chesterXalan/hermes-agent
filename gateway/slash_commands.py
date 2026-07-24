@@ -348,9 +348,60 @@ class GatewaySlashCommandsMixin:
         except Exception:
             _tip_line = ""
 
-        if session_info:
-            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
-        return EphemeralReply(f"{header}{_tip_line}")
+        final_text = (
+            f"{header}\n\n{session_info}{_tip_line}" if session_info else f"{header}{_tip_line}"
+        )
+
+        # Mattermost DM: when /new arrives outside a thread, post the reset
+        # banner as a flat root post via the adapter instead of the normal
+        # reply path.  reply_mode=thread would anchor the banner under the
+        # user's own "/new" message, making the *user's* post the thread
+        # root — which the bot can never retitle.  A flat bot-owned banner
+        # becomes the root of the next conversation thread, and the
+        # auto-title callback later rewrites it (Mattermost threads have no
+        # title field; the root post's text is what the Threads list shows).
+        if (
+            source.platform == Platform.MATTERMOST
+            and (source.chat_type or "").lower() == "dm"
+            and not source.thread_id
+        ):
+            adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+            send_banner = getattr(adapter, "send_session_banner", None)
+            if send_banner is not None:
+                # Re-derive the sanitized manual title (pure function, no
+                # side effects): the banner collapses to this after the
+                # first exchange, mirroring the auto-title flow.
+                _manual_title = ""
+                if _title_arg:
+                    try:
+                        from hermes_state import SessionDB as _SDB
+                        _manual_title = _SDB.sanitize_title(_title_arg) or ""
+                    except Exception:
+                        _manual_title = ""
+                hint_key = (
+                    "gateway.reset.mattermost_thread_hint_titled"
+                    if _manual_title
+                    else "gateway.reset.mattermost_thread_hint"
+                )
+                banner_text = f"{final_text}\n\n{t(hint_key)}"
+                try:
+                    banner_id = await send_banner(
+                        source.chat_id,
+                        banner_text,
+                        manual_title=_manual_title or None,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Mattermost session banner send failed; falling back to reply path",
+                        exc_info=True,
+                    )
+                    banner_id = None
+                if banner_id:
+                    # Banner delivered by the adapter; suppress the normal
+                    # reply so the reset notice isn't posted twice.
+                    return EphemeralReply("")
+
+        return EphemeralReply(final_text)
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
         """Handle /profile — show the profile serving this source and its home.

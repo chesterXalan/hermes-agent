@@ -51,3 +51,7 @@ optional_env:
     description: "React to incoming messages with 👀 while processing and ✅/❌ on completion (default true)."
     prompt: "Enable reactions? (true/false)"
     password: false
+  - name: MATTERMOST_AUTO_TITLE
+    description: "On /new in a DM, post a flat banner as the new thread root and auto-title it from the first exchange (default true)."
+    prompt: "Enable session-banner auto-title? (true/false)"
+    password: false
