@@ -258,6 +258,8 @@ gateway:
     title_error_untitled:  "\n⚠️ {error} — session started untitled."
     title_empty_untitled:  "\n⚠️ Title is empty after cleanup — session started untitled."
     tip:                   "\n✦ Tip: {tip}"
+    mattermost_thread_hint: "💬 Reply in this thread to start the conversation — it will be titled automatically."
+    mattermost_thread_hint_titled: "💬 Reply in this thread to start the conversation."
 
   restart:
     in_progress:           "⏳ Gateway restart already in progress..."

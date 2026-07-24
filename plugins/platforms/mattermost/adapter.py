@@ -398,6 +398,108 @@ class MattermostAdapter(BasePlatformAdapter):
             return data["root_id"]
         return post_id
 
+    # ------------------------------------------------------------------
+    # Session banner & thread title (auto-title support)
+    # ------------------------------------------------------------------
+
+    _SESSION_BANNER_PROP = "hermes_session_banner"
+    _THREAD_TITLE_MAX_CHARS = 80
+    # What a banner collapses to once its session has a title (auto or
+    # manual).  The root post's text is what the Threads list shows.
+    _TITLED_BANNER_FORMAT = "💬 {title}"
+
+    def _auto_title_enabled(self) -> bool:
+        """Check if session-banner threads + auto-title are enabled via env."""
+        return os.getenv("MATTERMOST_AUTO_TITLE", "true").lower() not in {"false", "0", "no"}
+
+    def _sanitize_thread_title(self, title: str) -> str:
+        """Collapse whitespace and cap length for a banner title line."""
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
+        if len(cleaned) > self._THREAD_TITLE_MAX_CHARS:
+            cleaned = cleaned[: self._THREAD_TITLE_MAX_CHARS - 3].rstrip() + "..."
+        return cleaned
+
+    async def send_session_banner(
+        self,
+        chat_id: str,
+        text: str,
+        manual_title: Optional[str] = None,
+    ) -> Optional[str]:
+        """Post a flat (non-threaded) session banner and return its post ID.
+
+        The banner becomes the root of a fresh conversation thread.  Replies
+        under it get their own gateway session, and the title callback later
+        collapses the banner text via ``rename_thread`` — Mattermost threads
+        have no title field, so the root post's text *is* the title shown in
+        the Threads list.  ``manual_title`` records a user-picked ``/new
+        <title>`` name: the banner then collapses to THAT title instead of
+        the generated one.
+        """
+        if not self._auto_title_enabled():
+            return None
+        if not chat_id or not text or self._session is None:
+            return None
+        banner_meta: Dict[str, Any] = {"auto_title": manual_title is None}
+        if manual_title:
+            banner_meta["manual_title"] = manual_title
+        data = await self._api_post(
+            "posts",
+            {
+                "channel_id": chat_id,
+                "message": text,
+                "props": {self._SESSION_BANNER_PROP: banner_meta},
+            },
+        )
+        post_id = data.get("id") if data else None
+        return str(post_id) if post_id else None
+
+    async def rename_thread(self, thread_id: str, title: str) -> bool:
+        """Collapse a banner root post to its session title line.
+
+        Only rewrites posts the bot itself created AND stamped with the
+        session-banner prop — a user's own thread root (or any ordinary bot
+        reply someone started a thread on) is never touched.  The reset
+        notice and thread hint have served their purpose once the user is
+        chatting in the thread, so the banner becomes a single
+        ``💬 <title>`` line (which is also what the Threads list shows).
+        Manual ``/new <title>`` banners collapse to the user's own title
+        instead of the generated one.
+        """
+        if not self._auto_title_enabled():
+            return False
+        title = self._sanitize_thread_title(title)
+        if not title or not thread_id or self._session is None:
+            return False
+        post = await self._api_get(f"posts/{thread_id}")
+        if not post or post.get("id") != thread_id:
+            return False
+        if post.get("root_id"):
+            return False  # a reply, not a thread root
+        if post.get("user_id") != self._bot_user_id:
+            return False  # not our post — never rewrite user content
+        props = post.get("props") or {}
+        banner_meta = props.get(self._SESSION_BANNER_PROP)
+        if not isinstance(banner_meta, dict):
+            return False  # ordinary bot post, not a session banner
+        if banner_meta.get("auto_title") is False:
+            # /new <title>: the user picked the name — collapse to THEIR
+            # title, never the generated one.  Legacy manual banners without
+            # a stored title are left untouched.
+            manual = self._sanitize_thread_title(str(banner_meta.get("manual_title") or ""))
+            if not manual:
+                return False
+            title = manual
+        new_props = dict(props)
+        new_props[self._SESSION_BANNER_PROP] = {**banner_meta, "titled": True}
+        data = await self._api_put(
+            f"posts/{thread_id}/patch",
+            {
+                "message": self._TITLED_BANNER_FORMAT.format(title=title),
+                "props": new_props,
+            },
+        )
+        return bool(data and data.get("id"))
+
     async def send(
         self,
         chat_id: str,

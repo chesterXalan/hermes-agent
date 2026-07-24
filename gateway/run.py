@@ -5308,6 +5308,13 @@ class TurnRunner:
                         source, session_id, title,
                     )
                 )
+            elif self._runner._is_mattermost_banner_thread_lane(source):
+                agent._on_session_title = lambda title, title_source: (
+                    title_source == "llm"
+                    and self._runner._schedule_mattermost_thread_title_rename(
+                        source, session_id, title,
+                    )
+                )
         except Exception:
             logger.debug("Failed to attach session title callback", exc_info=True)
 
@@ -23577,6 +23584,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Discord semantic thread rename failed", exc_info=True)
 
         future.add_done_callback(_log_rename_failure)
+
+    def _is_mattermost_banner_thread_lane(self, source: SessionSource) -> bool:
+        """True for Mattermost thread sessions that may sit under a bot banner root.
+
+        Kept deliberately thin: whether the thread root actually is a
+        retitleable session banner (bot-owned + stamped props) is verified
+        by the adapter's ``rename_thread`` against the live post, so user
+        created threads simply no-op there.
+        """
+        return source.platform == Platform.MATTERMOST and bool(source.thread_id)
+
+    async def _rename_mattermost_thread_for_session_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Best-effort write of a generated session title into the Mattermost banner root."""
+        if not self._is_mattermost_banner_thread_lane(source):
+            return
+        adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
+        if adapter is None:
+            return
+        rename_thread = getattr(adapter, "rename_thread", None)
+        if rename_thread is None:
+            return
+        try:
+            await rename_thread(str(source.thread_id), title)
+        except Exception:
+            logger.debug("Failed to rename Mattermost thread for generated session title", exc_info=True)
+
+    def _schedule_mattermost_thread_title_rename(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+    ) -> None:
+        """Schedule Mattermost banner retitle from the auto-title background thread."""
+        if not title or not self._is_mattermost_banner_thread_lane(source):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        try:
+            copied_source = dataclasses.replace(source)
+        except Exception:
+            copied_source = source
+        future = safe_schedule_threadsafe(
+            self._rename_mattermost_thread_for_session_title(copied_source, session_id, title),
+            loop,
+            logger=logger,
+            log_message="Mattermost thread retitle failed to schedule",
+        )
+        if future is None:
+            return
+
+        def _log_mm_rename_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Mattermost thread retitle failed", exc_info=True)
+
+        future.add_done_callback(_log_mm_rename_failure)
 
     async def _rename_telegram_topic_for_session_title(
         self,
