@@ -5533,11 +5533,49 @@ def _wait_for_launchd_service_pid(
             return False
         time.sleep(0.5)
 
+def _wait_for_launchd_service_restart(
+    previous_pid: int | None = None,
+    timeout: float = 60.0,
+) -> bool:
+    """Wait for a replacement gateway process after a launchd restart handoff."""
+    import time
+
+    from gateway.status import get_running_pid
+
+    deadline = time.monotonic() + timeout
+    printed_runtime_wait = False
+
+    while time.monotonic() < deadline:
+        new_pid = get_running_pid()
+        if new_pid and (previous_pid is None or new_pid != previous_pid):
+            runtime_state = _gateway_runtime_status_for_pid(new_pid)
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if gateway_state == "running":
+                print(f"✓ Service restarted (PID {new_pid})")
+                return True
+            if gateway_state == "startup_failed":
+                reason = (runtime_state or {}).get("exit_reason") or "startup failed"
+                print(
+                    f"⚠ Service process restarted (PID {new_pid}), but gateway startup failed: {reason}"
+                )
+                return False
+            if not printed_runtime_wait:
+                print(
+                    f"⏳ Service process started (PID {new_pid}); waiting for gateway runtime..."
+                )
+                printed_runtime_wait = True
+        time.sleep(1)
+
+    print(
+        f"⚠ Service did not come back within {int(timeout)}s.\n"
+        "  Check status: hermes gateway status\n"
+        "  Check logs:   hermes logs -n 50"
+    )
+    return False
 
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
-    drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
@@ -5561,26 +5599,40 @@ def launchd_restart():
             _escalate_wedged_gateway(pid)
             pid = None
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
+            # Mirror the systemd branch: ask the gateway to restart itself via
+            # SIGUSR1 (request_restart(via_service=True)) so it refuses new
+            # turns, finishes in-flight work, sends its restart lifecycle
+            # notifications, writes the planned-restart marker, and exits with
+            # the service-restart code for launchd's KeepAlive to relaunch.
+            # The previous SIGTERM path read as an unplanned shutdown inside
+            # the gateway: chats got "shutting down" with no resume hint and
+            # no comeback notice.  Announce the wait BEFORE starting it — it
+            # can run for the full budget while in-flight runs finish, and it
+            # streams into surfaces with no other feedback (#44515).
+            wait_budget = _get_restart_exit_wait_budget()
             print(
-                f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {drain_timeout:.0f}s)..."
+                f"⏳ Service restarting gracefully (PID {pid}) — "
+                f"waiting up to {wait_budget:.0f}s for in-flight turns + drain..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
-                    )
+            if _graceful_restart_via_sigusr1(pid, wait_budget):
+                # KeepAlive respawns on any exit, but ThrottleInterval (30s)
+                # can delay the relaunch — kickstart (no -k: the old PID has
+                # already exited) starts the replacement immediately and is a
+                # no-op when launchd beat us to it.
+                subprocess.run(
+                    ["launchctl", "kickstart", target], check=True, timeout=90
+                )
+                _wait_for_launchd_service_restart(previous_pid=pid)
+                _clear_launchd_unsupported_marker()
+                return
+            # SIGUSR1 could not be delivered or the gateway did not exit
+            # within the budget (which already covers after-turn wait + drain).
+            # Mirror systemd's fallback: force the restart rather than running
+            # a second SIGTERM drain on a process that just ignored one budget.
+            print(
+                f"⚠ Graceful restart did not complete within {wait_budget:.0f}s; "
+                "forcing launchd restart"
+            )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()

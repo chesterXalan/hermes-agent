@@ -962,6 +962,102 @@ class TestGatewaySystemServiceRouting:
         assert run_calls == []
 
 
+class TestLaunchdGracefulRestart:
+    """launchd restart mirrors the systemd SIGUSR1 graceful-restart path."""
+
+    def _patch_common(self, monkeypatch, calls, *, pid, graceful_result):
+        monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: "ai.hermes.gateway")
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda _pid: False)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
+        monkeypatch.setattr(gateway_cli, "_clear_launchd_unsupported_marker", lambda: None)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda _pid, timeout: calls.append(("graceful", _pid, timeout)) or graceful_result,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda _pid, force=False: calls.append(("terminate", _pid, force)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_restart",
+            lambda previous_pid=None, timeout=60.0: calls.append(("wait", previous_pid)) or True,
+        )
+
+        def fake_subprocess_run(cmd, **kwargs):
+            calls.append(("run", cmd))
+            return SimpleNamespace(stdout="", returncode=0)
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_subprocess_run)
+
+    def test_graceful_path_uses_sigusr1_and_plain_kickstart(self, monkeypatch, capsys):
+        calls = []
+        self._patch_common(monkeypatch, calls, pid=654, graceful_result=True)
+
+        gateway_cli.launchd_restart()
+
+        assert ("graceful", 654, 27.0) in calls
+        run_cmds = [cmd for tag, *rest in calls if tag == "run" for cmd in [rest[0]]]
+        assert ["launchctl", "kickstart", "gui/501/ai.hermes.gateway"] in run_cmds
+        assert not any("-k" in cmd for cmd in run_cmds)
+        assert not any(tag == "terminate" for tag, *_ in calls)
+        assert ("wait", 654) in calls
+        out = capsys.readouterr().out.lower()
+        assert "restarting gracefully" in out
+        assert "27" in out  # must use the mocked budget, not live defaults
+
+    def test_falls_back_to_forced_kickstart_on_graceful_timeout(self, monkeypatch, capsys):
+        calls = []
+        self._patch_common(monkeypatch, calls, pid=654, graceful_result=False)
+
+        gateway_cli.launchd_restart()
+
+        run_cmds = [cmd for tag, *rest in calls if tag == "run" for cmd in [rest[0]]]
+        assert ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway"] in run_cmds
+        # No second SIGTERM drain after a full graceful budget already elapsed.
+        assert not any(tag == "terminate" for tag, *_ in calls)
+        assert not any(tag == "wait" for tag, *_ in calls)
+        out = capsys.readouterr().out.lower()
+        assert "did not complete" in out
+
+    def test_without_running_pid_uses_forced_kickstart(self, monkeypatch, capsys):
+        calls = []
+        self._patch_common(monkeypatch, calls, pid=None, graceful_result=True)
+
+        gateway_cli.launchd_restart()
+
+        assert not any(tag == "graceful" for tag, *_ in calls)
+        run_cmds = [cmd for tag, *rest in calls if tag == "run" for cmd in [rest[0]]]
+        assert ["launchctl", "kickstart", "-k", "gui/501/ai.hermes.gateway"] in run_cmds
+        assert "service restarted" in capsys.readouterr().out.lower()
+
+    def test_wait_helper_reports_running_replacement(self, monkeypatch, capsys):
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 999)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {"gateway_state": "running"},
+        )
+
+        assert gateway_cli._wait_for_launchd_service_restart(previous_pid=654) is True
+        assert "restarted (pid 999)" in capsys.readouterr().out.lower()
+
+    def test_wait_helper_reports_startup_failure(self, monkeypatch, capsys):
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 999)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_gateway_runtime_status_for_pid",
+            lambda pid: {"gateway_state": "startup_failed", "exit_reason": "bad config"},
+        )
+
+        assert gateway_cli._wait_for_launchd_service_restart(previous_pid=654) is False
+        assert "bad config" in capsys.readouterr().out.lower()
+
+
 class TestDetectVenvDir:
     """Tests for _detect_venv_dir() virtualenv detection."""
 
