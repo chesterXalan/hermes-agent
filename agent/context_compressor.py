@@ -3285,6 +3285,10 @@ class ContextCompressor(ContextEngine):
         # Re-entrancy guard for the sequential summary fold: chunk calls and
         # the fallback-retry recursion must not re-plan a fold of their own.
         self._in_summary_fold: bool = False
+        # (id, len, text) of the window serialization the fold planner already
+        # produced for the no-fold case; _generate_summary consumes it instead
+        # of serializing the same turns a second time.
+        self._planned_summary_serialization = None
         # Fold-level summary token budget: the per-chunk calls must target
         # the full window's budget, not the (smaller) last chunk's, or the
         # accumulated iterative summary gets squeezed on the final step.
@@ -4718,6 +4722,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         ``_SUMMARY_FOLD_MAX_CHUNKS`` merges into the final chunk, where the
         single-call input bound applies as before.
         """
+        self._planned_summary_serialization = None
         if not self.summary_model or getattr(self, "_in_summary_fold", False):
             return [turns_to_summarize]
         if len(turns_to_summarize) < 2:
@@ -4746,19 +4751,32 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 - _SUMMARY_FIT_MARGIN_TOKENS,
             )
 
+        # Serialize the whole window ONCE for the fits-check. Compression can
+        # fire several times per hour on heavy sessions, and the common case
+        # is "no fold needed" — sizing per group here and then serializing the
+        # window again in _generate_summary would run the redaction-heavy
+        # serializer twice per compaction. The full serialization is stashed
+        # for _generate_summary to reuse; per-group serialization (needed for
+        # chunk packing) is paid only on the rare fold path.
+        full_serialized = self._serialize_for_summary(turns_to_summarize)
+        total_chars = len(full_serialized)
+        total_tokens = (
+            estimate_tokens_rough(full_serialized) if token_cap else 0
+        )
+        if total_chars <= char_cap and (not token_cap or total_tokens <= token_cap):
+            self._planned_summary_serialization = (
+                id(turns_to_summarize),
+                len(turns_to_summarize),
+                full_serialized,
+            )
+            return [turns_to_summarize]
+
         sizes = []
-        total_chars = 0
-        total_tokens = 0
         for group in groups:
             serialized = self._serialize_for_summary(group)
             g_chars = len(serialized)
             g_tokens = estimate_tokens_rough(serialized) if token_cap else 0
             sizes.append((g_chars, g_tokens))
-            total_chars += g_chars
-            total_tokens += g_tokens
-
-        if total_chars <= char_cap and (not token_cap or total_tokens <= token_cap):
-            return [turns_to_summarize]
 
         chunks: List[List[Dict[str, Any]]] = []
         cur: List[Dict[str, Any]] = []
@@ -4900,7 +4918,18 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             int(getattr(self, "_summary_fold_budget", 0) or 0)
             or self._compute_summary_budget(turns_to_summarize)
         )
-        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+        _planned = getattr(self, "_planned_summary_serialization", None)
+        self._planned_summary_serialization = None
+        if (
+            isinstance(_planned, tuple)
+            and len(_planned) == 3
+            and _planned[0] == id(turns_to_summarize)
+            and _planned[1] == len(turns_to_summarize)
+        ):
+            # Reuse the fold planner's serialization of these exact turns.
+            content_to_summarize = _planned[2]
+        else:
+            content_to_summarize = self._serialize_for_summary(turns_to_summarize)
         # P2 ghost-skill defense (#32106): [SKILL_PRUNED: ...] markers entering
         # the summarizer are prompt INPUT only — LLMs routinely paraphrase them
         # into vague prose ("some skills were loaded"), which erases the reload

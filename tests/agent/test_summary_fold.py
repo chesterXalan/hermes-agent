@@ -95,6 +95,32 @@ class TestPlanSummaryFold:
             # A chunk never starts with a dangling tool result.
             assert chunk[0].get("role") in ("user", "assistant")
 
+    def test_no_fold_path_serializes_exactly_once(self):
+        """Heavy sessions compact several times per hour; the common no-fold
+        case must not pay for the redaction-heavy serializer twice (once for
+        planner sizing, once for the prompt). The planner's serialization is
+        stashed and reused by _generate_summary."""
+        c = _compressor(aux_window=272_000)
+        turns = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} " + "x" * 500}
+            for i in range(40)
+        ]
+        calls = {"n": 0}
+        real = c._serialize_for_summary
+
+        def _counting(t):
+            calls["n"] += 1
+            return real(t)
+
+        c._serialize_for_summary = _counting
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=_response("summary body"),
+        ):
+            assert c._generate_summary(turns)
+
+        assert calls["n"] == 1
+
     def test_fold_guard_prevents_replanning(self):
         c = _compressor(aux_window=128_000)
         c._in_summary_fold = True
