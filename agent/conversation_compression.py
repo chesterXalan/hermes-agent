@@ -3160,6 +3160,27 @@ def compress_context(
             getattr(agent.context_compressor, "_last_feasibility_skip", False)
         )
 
+        # One-time per-session notice when the per-call window fit actually
+        # engaged: the summary succeeded, but the aux model's window forced
+        # input trimming. Educates users on the config remedy without the
+        # per-compression noise the old auto-lower warning produced (it fired
+        # at session start whether or not trimming would ever happen).
+        if getattr(agent.context_compressor, "_last_summary_input_trimmed", False) is True:
+            agent.context_compressor._last_summary_input_trimmed = False
+            if not getattr(agent, "_summary_trim_notice_sent", False):
+                agent._summary_trim_notice_sent = True
+                _trim_model = (
+                    getattr(agent.context_compressor, "summary_model", "") or "?"
+                )
+                agent._emit_status(
+                    f"ℹ Compression model {_trim_model}'s context window is "
+                    "smaller than this conversation's summarizer input, so "
+                    "the input was trimmed to fit (oldest middle turns "
+                    "shortened first). For untrimmed summaries, set "
+                    "auxiliary.compression.model in config.yaml to a "
+                    "larger-context model."
+                )
+
         # If compression aborted (aux LLM failed to produce a usable summary)
         # the compressor returns the input messages unchanged.  Surface the
         # error to the user, skip the session-rotation work entirely (no
