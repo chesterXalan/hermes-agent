@@ -135,6 +135,8 @@ class TestGenerateSummaryWindowFit:
         fit_budget = 70_000 - budget - _SUMMARY_FIT_MARGIN_TOKENS
         assert estimate_tokens_rough(prompt) <= fit_budget
         assert "summary input truncated" in prompt
+        # Signal consumed by compress_context's one-time user notice.
+        assert c._last_summary_input_trimmed is True
 
     def test_no_trim_without_stashed_window(self):
         c = _compressor()

@@ -2303,6 +2303,7 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_summary_input_trimmed = False
         self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -2607,6 +2608,7 @@ class ContextCompressor(ContextEngine):
         self._consecutive_timeout_failures = 0
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_summary_input_trimmed = False
         self._last_feasibility_skip = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
@@ -5463,6 +5465,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if _aux_window and self.summary_model:
             _fit_budget = _aux_window - summary_budget - _SUMMARY_FIT_MARGIN_TOKENS
             _fit_trimmed = False
+            _fit_floor_warned = False
             for _ in range(4):
                 _prompt_tokens = estimate_tokens_rough(prompt)
                 if _fit_budget <= 0 or _prompt_tokens <= _fit_budget:
@@ -5478,6 +5481,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                         _fit_budget,
                         _SUMMARY_FIT_MIN_CONTENT_CHARS,
                     )
+                    _fit_floor_warned = True
                     break
                 _target_chars = max(
                     _SUMMARY_FIT_MIN_CONTENT_CHARS,
@@ -5496,14 +5500,31 @@ This compaction should PRIORITISE preserving all information related to the focu
                 prompt = _assemble_prompt(content_to_summarize)
                 _fit_trimmed = True
             if _fit_trimmed:
-                logger.info(
-                    "Summarizer input trimmed to fit %s's %d-token window "
-                    "(prompt ~%d tokens, output budget %d).",
-                    self.summary_model,
-                    _aux_window,
-                    estimate_tokens_rough(prompt),
-                    summary_budget,
-                )
+                _final_prompt_tokens = estimate_tokens_rough(prompt)
+                # Signal for the one-time user-facing notice surfaced by
+                # compress_context (mirrors _last_summary_fallback_used).
+                self._last_summary_input_trimmed = True
+                if _final_prompt_tokens > _fit_budget and not _fit_floor_warned:
+                    # Iteration cap exhausted without converging — distinct
+                    # from the floor case above, which already warned.
+                    logger.warning(
+                        "Summarizer input trim did not converge: prompt "
+                        "~%d tokens still exceeds %s's fit budget "
+                        "(%d tokens) after 4 passes — sending best effort; "
+                        "a failure falls back to the main model.",
+                        _final_prompt_tokens,
+                        self.summary_model,
+                        _fit_budget,
+                    )
+                else:
+                    logger.info(
+                        "Summarizer input trimmed to fit %s's %d-token "
+                        "window (prompt ~%d tokens, output budget %d).",
+                        self.summary_model,
+                        _aux_window,
+                        _final_prompt_tokens,
+                        summary_budget,
+                    )
 
         try:
             call_kwargs = {
@@ -7942,6 +7963,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
+        self._last_summary_input_trimmed = False
         self._last_feasibility_skip = False
         self._last_summary_error = None
         self._last_aux_model_failure_error = None
